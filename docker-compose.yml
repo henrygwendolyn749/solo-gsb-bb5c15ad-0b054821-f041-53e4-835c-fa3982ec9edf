@@ -1,0 +1,20 @@
+services:
+  range-planner:
+    build: .
+    image: range-planner:latest
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # /secure-request 的 HMAC-SHA256 密钥表，逗号分隔的 key_id=secret。
+      # 生产环境请通过 .env / secret 管理注入，不要提交真实密钥。
+      SECURE_REQUEST_KEYS: "${SECURE_REQUEST_KEYS:-}"
+      # 允许的请求时间戳偏差（秒），默认 300。
+      SECURE_REQUEST_TIMESTAMP_SKEW: "${SECURE_REQUEST_TIMESTAMP_SKEW:-300}"
+      # nonce 保留窗口（秒），默认 2 倍时间偏差。
+      SECURE_REQUEST_NONCE_TTL: "${SECURE_REQUEST_NONCE_TTL:-600}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3

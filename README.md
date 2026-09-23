@@ -9,6 +9,12 @@
 - `POST /assemble`：回显 `/plan` 的 `blocks`、`mappings`（以及 `cached_blocks`），
   并分别按块提供 Base64 回源内容与缓存内容；服务严格校验来源 id、边界、缺块
   与重复块后，依据切片映射按原 ranges 顺序重组，返回每段范围的 Base64 内容与长度。
+- `POST /multipart-parse`：解析上游对多区间 Range 请求返回的
+  `multipart/byteranges` **完整响应体**（Base64 传输）。严格按 CRLF 切分每个
+  part，校验 `Content-Range` 闭区间、part 字节长度、对象总长度/边界、
+  `Content-Type` 与 part 唯一性；part 集合必须与期望的 interval/suffix ranges
+  一一对应（缺段、多段、重复段、错误 boundary、头部注入、非法 Base64、范围
+  不匹配均返回可定位的 `422`），然后按期望 ranges 顺序返回各段 Base64 内容。
 - `POST /secure-request`：上述两个操作的**统一鉴权入口**。请求携带 `operation`
   （`plan` 或 `assemble`）、`payload`（原接口请求体）以及 `key_id` / `timestamp`
   / `nonce` / `signature`；服务按固定 JSON 规范化后用环境配置的 HMAC-SHA256
@@ -242,6 +248,126 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 `cached_blocks` 一起提交给 `/assemble`，即可取回与原请求 ranges 一一对应
 的字节内容。
 
+### `POST /multipart-parse`
+
+当上游（或代理）直接返回多区间响应 `Content-Type: multipart/byteranges;
+boundary=...` 时，可用本端点把**完整响应体**解析回与请求 ranges 一一对应的
+字节段。请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `object_length` | 对象总字节长度；每个 part 的 `Content-Range` total 必须与之相等 |
+| `ranges` | 期望的范围列表（`interval` 闭区间或 `suffix`），同时决定输出顺序；规范化后区间不得重复 |
+| `boundary` | 上游实际使用的 boundary 值（不含前导 `--`），仅允许 RFC 2046 bcharsnospace 字符 |
+| `expected_content_type` | 可选；提供时每个 part 的 `Content-Type` 去首尾空白后必须与之完全一致（大小写不敏感） |
+| `body_b64` | 上游完整 multipart 响应体的标准 Base64（含全部 boundary 行、part 头与正文） |
+
+请求示例（对象 256 字节，期望 `bytes=0-99` 与末尾 16 字节；响应原文 317 字节）：
+
+```json
+{
+  "object_length": 256,
+  "ranges": [
+    {"type": "interval", "start": 0, "end": 99},
+    {"type": "suffix", "last_n": 16}
+  ],
+  "boundary": "8K3mZ9QrTx2v",
+  "expected_content_type": "application/octet-stream",
+  "body_b64": "LS04SzNtWjlRclR4MnYNCkNvbnRlbnQtVHlwZTogYXBwbGljYXRpb24vb2N0ZXQtc3RyZWFtDQpDb250ZW50LVJhbmdlOiBieXRlcyAwLTk5LzI1Ng0KDQoAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjDQotLThLM21aOVFyVHgydg0KQ29udGVudC1UeXBlOiBhcHBsaWNhdGlvbi9vY3RldC1zdHJlYW0NCkNvbnRlbnQtUmFuZ2U6IGJ5dGVzIDI0MC0yNTUvMjU2DQoNCvDx8vP09fb3+Pn6+/z9/v8NCi0tOEszbVo5UXJUeDJ2LS0="
+}
+```
+
+成功时**按 `ranges` 输入顺序**（而非上游 part 顺序）返回各段，`suffix`
+规范化为实际闭区间；`parts` 为解析到的 part 数量：
+
+```json
+{
+  "object_length": 256,
+  "boundary": "8K3mZ9QrTx2v",
+  "parts": 2,
+  "ranges": [
+    {"index": 0, "type": "interval", "start": 0, "end": 99, "length": 100, "data_b64": "AAECAw..."},
+    {"index": 1, "type": "suffix",   "start": 240, "end": 255, "length": 16, "data_b64": "8PHy8..."}
+  ]
+}
+```
+
+仅依赖标准库、可直接运行的模拟上游 + 调用 + 逐字节核对示例见
+[`examples/multipart_parse_example.py`](examples/multipart_parse_example.py)：
+
+```
+python examples/multipart_parse_example.py
+```
+
+#### 严格解析与校验规则
+
+分帧（RFC 2046 风格，但比 RFC 更严格，任何不合规结构都返回 `422`）：
+
+1. 响应体必须以 `--boundary` 开头，**不允许前导 preamble/字节**；
+2. 每个 boundary 行后必须紧跟 CRLF，**拒绝裸 LF**；part 头与正文之间必须是
+   恰好一个 `CRLFCRLF`；
+3. 必须以 `--boundary--` 结束，其后**不允许任何拖尾字节（epilogue）**；
+   响应截断、找不到下一边界均拒绝；
+4. `body_b64` 必须是含正确填充的标准 Base64（`validate=True`，拒绝 URL-safe
+   字母表与夹杂的空白）。
+
+每个 part 的头部：
+
+1. 逐行按 CRLF 解析，头部名必须是合法 token，取值不得包含控制字符；
+   **拒绝折行（obs-fold）、空行、缺少冒号的行**；
+2. **只允许 `Content-Type` 与 `Content-Range` 两个头部，且各自恰好出现一次**；
+   任何其他头部（如 `Content-Length`、`X-...`、`Set-Cookie` 等）一律按
+   头部注入（`unexpected_header`）拒绝，重复头部为 `duplicate_header`；
+3. `Content-Range` 必须严格形如 `bytes <start>-<end>/<total>`（total 为十进制
+   整数，不接受 `*`）；`total == object_length`、`start <= end`、
+   `0 <= start`、`end < total`；part 正文字节数必须恰好等于
+   `end - start + 1`；
+4. `Content-Type` 必须是合法的 `type/subtype`（参数值支持 token 或
+   quoted-string）；若请求提供了 `expected_content_type` 则必须与之匹配
+   （大小写不敏感，允许 OWS）。
+
+part 集合与期望范围：
+
+1. 期望 `ranges` 先规范化为闭区间（suffix 同 `/plan` 语义；空对象上的 suffix
+   与越界 interval 返回 `422`），规范化后区间**不得重复**；
+2. 每个 part 的区间必须命中某个期望区间：未命中的为多余段
+   （`unexpected_part`），相同区间的 part 重复为 `duplicate_part`；
+3. 全部解析完成后做存在性核对：缺少期望区间对应的 part 返回 `missing_part`
+   （响应中给出所有缺失区间）。
+
+所有错误均为 HTTP `422`，响应体为
+`{"error": "<code>", "detail": [{"message": ..., "loc": ..., ...}]}`，其中
+`loc` 精确定位，例如 `parts[1].content_range`、`parts[0].headers[2]`、
+`ranges[0]`、`body_b64`，并在适用时附带 `part_index` / `range_index` /
+`start` / `end`。主要错误码：
+
+| error | 含义 |
+| --- | --- |
+| `invalid_base64` | `body_b64` 非法 Base64 或填充错误 |
+| `bad_boundary` | 响应体未以 `--boundary` 开头（含前导字节/preamble） |
+| `bad_boundary_line` | boundary 行后不是 CRLF（裸 LF 或其他字节） |
+| `truncated_multipart` | 响应体截断，缺少边界行 |
+| `trailing_bytes` | 结束边界之后存在拖尾字节/epilogue |
+| `empty_multipart` | multipart 中没有任何 part |
+| `missing_header_terminator` | part 缺少 `CRLFCRLF` 头/正文分隔 |
+| `missing_headers` | part 的头部块为空 |
+| `malformed_header` | 头部行格式非法（缺冒号、名称非法等） |
+| `header_injection` | 头部折行、空行或取值含控制字符 |
+| `unexpected_header` | 出现 Content-Type/Content-Range 之外的头部 |
+| `duplicate_header` | 同一头部在 part 中重复出现 |
+| `missing_content_range` / `missing_content_type` | 缺少必需头部 |
+| `invalid_content_range` | Content-Range 格式或闭区间非法 |
+| `invalid_content_type` | Content-Type 语法非法 |
+| `content_type_mismatch` | 与 `expected_content_type` 不一致 |
+| `object_length_mismatch` | Content-Range 的 total 与对象长度不符 |
+| `part_out_of_bounds` | part 区间超出对象边界 |
+| `part_length_mismatch` | part 正文字节数与 Content-Range 声明长度不符 |
+| `duplicate_part` | 相同 Content-Range 区间的 part 重复 |
+| `unexpected_part` | part 区间不在期望 ranges 中（多余段） |
+| `missing_part` | 期望范围缺少对应 part（缺段） |
+| `invalid_range` / `range_out_of_bounds` / `unsatisfiable_suffix` | 期望范围非法、越界或空对象 suffix |
+| `duplicate_expected_range` | 期望 ranges 规范化后区间重复 |
+
 ### `POST /secure-request`
 
 `/plan` 与 `/assemble` 的统一鉴权入口。`payload` 字段就是对应操作的原始
@@ -336,6 +462,9 @@ envelope["signature"] = hmac.new(
 
 - 字段类型或约束错误：`{"error": "invalid_request", "detail": [...]}`；
   `/secure-request` 中 payload 字段错误的路径以 `payload` 开头；
+- `/multipart-parse` 的分帧、头部、范围与 Base64 校验错误同样为 `422`，
+  错误码与 `loc` 定位规则见上方 [`POST /multipart-parse`](#post-multipart-parse)
+  一节；
 - `/plan` 范围不可满足：`{"error": "unsatisfiable", "message": ..., "range_index": ...}`；
 - `/assemble` 组装错误：`{"error": "<code>", "detail": [{"message": ..., "loc": ...}]}`，
   其中 `loc` 指向出错的字段路径（如 `contents[2].data_b64`、

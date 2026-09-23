@@ -18,6 +18,15 @@ operation（plan 或 assemble）、payload（即原接口请求体）、key_id�
 timestamp、nonce、signature；服务按固定 JSON 规范化后用环境配置的
 HMAC-SHA256 密钥验签，限制时间偏差，并对 key_id+nonce 做窗口内防重放。
 验签通过后执行对应操作并原样返回其响应；/plan 与 /assemble 本身不受影响。
+
+POST /multipart-parse 解析上游返回的 multipart/byteranges 完整响应体
+（Base64 传输）：请求提供对象总长度、期望的 interval/suffix ranges 与
+实际使用的 boundary。服务严格按 CRLF 切分每个 part（拒绝前导/拖尾字节、
+裸 LF、截断与非分隔行），逐 part 校验头部（仅允许 Content-Type 与
+Content-Range 且各出现一次，拒绝折行/重复/未知头部等头部注入）、
+Content-Range 的 bytes 闭区间与对象总长度、part 字节长度与对象边界；
+各 part 的区间必须与期望 ranges 规范化后的区间一一对应（无缺段、多段、
+重复段），最后按期望 ranges 顺序返回每段的 Base64 内容。
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import threading
 import time
 from typing import Annotated, Any, Literal, Union
@@ -43,6 +53,7 @@ from pydantic import (
     Field,
     StrictInt,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -261,6 +272,68 @@ class AssembleResponse(BaseModel):
     )
 
 
+# ------------------- /multipart-parse 请求/响应模型 -------------------
+
+
+_MULTIPART_BOUNDARY_MAX_LENGTH = 70
+
+
+class MultipartParseRequest(BaseModel):
+    """multipart/byteranges 解析请求。
+
+    body_b64 为上游完整响应体（含所有 boundary 行与 part 头）的标准
+    Base64 编码；boundary 为实际用在 boundary 分隔行中的值（即上游
+    Content-Type: multipart/byteranges; boundary=... 中的 boundary）。
+    """
+
+    object_length: Annotated[int, StrictInt] = Field(
+        ..., ge=0, description="对象总字节长度（必须与 Content-Range 的 total 一致）"
+    )
+    ranges: list[RangeSpec] = Field(
+        ..., min_length=1, description="期望返回的范围列表（闭区间或 suffix），决定输出顺序"
+    )
+    boundary: str = Field(
+        ...,
+        min_length=1,
+        max_length=_MULTIPART_BOUNDARY_MAX_LENGTH,
+        description="multipart 分隔行中的 boundary 值（不含前导 --）",
+    )
+    expected_content_type: str | None = Field(
+        None,
+        description="可选：若提供，每个 part 的 Content-Type 去除首尾空白后必须与之完全一致（大小写不敏感）",
+    )
+    body_b64: str = Field(..., description="上游完整 multipart/byteranges 响应体（标准 Base64）")
+
+    @field_validator("boundary")
+    @classmethod
+    def _check_boundary_chars(cls, v: str) -> str:
+        # RFC 2046 bchars：不含空白与 tspecials（" ( ) , / : ; < = > ? @ [ ] \\）。
+        if not _BOUNDARY_RE.fullmatch(v):
+            raise ValueError(
+                "boundary 非法：仅允许 RFC 2046 bcharsnospace 字符，"
+                '不得含空白或 " ( ) , : ; < > @ [ ] \\ 等字符'
+            )
+        return v
+
+
+class MultipartRange(BaseModel):
+    index: int = Field(..., description="该范围在请求 ranges 中的下标")
+    type: Literal["interval", "suffix"]
+    start: int = Field(..., description="规范化后的起始字节偏移（含）")
+    end: int = Field(..., description="规范化后的结束字节偏移（含）")
+    length: int = Field(..., ge=1, description="解析出的字节数")
+    data_b64: str = Field(..., description="该段内容（标准 Base64）")
+
+
+class MultipartParseResponse(BaseModel):
+    object_length: int
+    boundary: str = Field(..., description="实际采用的 boundary（回显）")
+    parts: int = Field(..., ge=1, description="解析到的 part 数量")
+    ranges: list[MultipartRange] = Field(
+        ..., description="按请求 ranges 顺序排列的各段内容"
+    )
+
+
 # ---------------------- /secure-request 请求模型 ----------------------
 
 
@@ -363,6 +436,56 @@ async def assembly_error_handler(request: Request, exc: AssemblyError):
         detail["range_index"] = exc.range_index
     if exc.slice_index is not None:
         detail["slice_index"] = exc.slice_index
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "detail": [detail]},
+    )
+
+
+class MultipartParseError(Exception):
+    """multipart/byteranges 解析与校验失败，统一对应 HTTP 422。
+
+    loc 为可定位的字段路径：
+      - "body_b64"：整体响应体或 Base64 本身的问题；
+      - "ranges[i]"：期望范围规范化后的问题（区间非法、越界、重复等）；
+      - "parts[p].<header>"：第 p 个 part（从 0 起）的结构/头部/范围问题。
+    range_index / part_index 在适用时给出。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        loc: str | None = None,
+        *,
+        part_index: int | None = None,
+        range_index: int | None = None,
+        start: int | None = None,
+        end: int | None = None,
+        code: str = "multipart_parse_error",
+    ):
+        self.message = message
+        self.loc = loc
+        self.part_index = part_index
+        self.range_index = range_index
+        self.start = start
+        self.end = end
+        self.code = code
+        super().__init__(message)
+
+
+@app.exception_handler(MultipartParseError)
+async def multipart_parse_error_handler(request: Request, exc: MultipartParseError):
+    detail: dict[str, object] = {"message": exc.message}
+    if exc.loc is not None:
+        detail["loc"] = exc.loc
+    if exc.part_index is not None:
+        detail["part_index"] = exc.part_index
+    if exc.range_index is not None:
+        detail["range_index"] = exc.range_index
+    if exc.start is not None:
+        detail["start"] = exc.start
+    if exc.end is not None:
+        detail["end"] = exc.end
     return JSONResponse(
         status_code=422,
         content={"error": exc.code, "detail": [detail]},
@@ -1082,6 +1205,495 @@ def assemble(req: AssembleRequest) -> AssembleResponse:
         )
 
     return AssembleResponse(object_length=req.object_length, ranges=results)
+
+
+# --------------------------- /multipart-parse ---------------------------
+
+# RFC 2046 bcharsnospace：DIGIT / ALPHA / 部分标点（不含空格与 tspecials）。
+_BOUNDARY_RE = re.compile(r"^[0-9A-Za-z'()+_,-./:=?]{1,70}$")
+# token（RFC 7230）：除分隔符与空白、控制字符外的可见 ASCII。
+_TOKEN_RE = re.compile(rb"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+# quoted-string 取值（不含外层引号）：qdtext（含 tab）或 quoted-pair。
+_QUOTED_VALUE_RE = re.compile(rb'^(?:[\t\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\t\x20-\x7e])*$')
+# Content-Range: bytes <start>-<end>/<total>（仅数字 total，不接受 *）。
+_CONTENT_RANGE_RE = re.compile(rb"^bytes[ \t]+(\d+)-(\d+)/(\d+)$")
+_CRLF = b"\r\n"
+_BLANK_CRLF = b"\r\n\r\n"
+
+# 每个 part 允许出现的头部（全部小写）；任何其他头部都按头部注入拒绝。
+_ALLOWED_PART_HEADERS = frozenset({"content-type", "content-range"})
+
+
+def _decode_b64_multipart(raw: str) -> bytes:
+    """严格按标准 Base64（含正确填充、validate=True）解码完整响应体。"""
+    if len(raw) % 4 != 0:
+        raise MultipartParseError(
+            "Base64 长度不是 4 的倍数，缺少填充或包含非法字符",
+            "body_b64",
+            code="invalid_base64",
+        )
+    try:
+        return base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise MultipartParseError(
+            f"Base64 解码失败：{exc}",
+            "body_b64",
+            code="invalid_base64",
+        )
+
+
+def _normalize_expected_ranges(req: MultipartParseRequest) -> list[tuple[int, int]]:
+    """把期望 ranges 规范化为闭区间，校验合法性、对象边界与唯一性。"""
+    normalized: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for i, spec in enumerate(req.ranges):
+        if spec.type == "interval":
+            start, end = spec.start, spec.end
+            if end < start:
+                raise MultipartParseError(
+                    "end 不得小于 start",
+                    f"ranges[{i}]",
+                    range_index=i,
+                    start=start,
+                    end=end,
+                    code="invalid_range",
+                )
+            if end >= req.object_length:
+                raise MultipartParseError(
+                    f"区间 [{start},{end}] 越界：对象长度为 {req.object_length}",
+                    f"ranges[{i}]",
+                    range_index=i,
+                    start=start,
+                    end=end,
+                    code="range_out_of_bounds",
+                )
+        else:  # suffix
+            start = max(0, req.object_length - spec.last_n)
+            end = req.object_length - 1
+            if start > end:
+                raise MultipartParseError(
+                    "空对象无法满足 suffix 范围请求",
+                    f"ranges[{i}]",
+                    range_index=i,
+                    code="unsatisfiable_suffix",
+                )
+        if (start, end) in seen:
+            raise MultipartParseError(
+                f"期望范围 [{start},{end}] 在 ranges 中重复，multipart 中无法出现重复段",
+                f"ranges[{i}]",
+                range_index=i,
+                start=start,
+                end=end,
+                code="duplicate_expected_range",
+            )
+        seen.add((start, end))
+        normalized.append((start, end))
+    return normalized
+
+
+def _validate_content_type(raw_value: bytes, part_index: int, loc: str) -> str:
+    """校验 Content-Type 头部取值的语法，返回去首尾空白后的小写值。
+
+    接受 `token "/" token *( OWS ";" OWS parameter )`，参数值可为 token
+    或 quoted-string；不允许折行、裸 LF、空值、非法字符。
+    """
+    if not raw_value or any(c in raw_value for c in b"\r\n"):
+        raise MultipartParseError(
+            "Content-Type 取值为空或包含换行",
+            loc,
+            part_index=part_index,
+            code="malformed_header",
+        )
+    value = raw_value.strip(b" \t")
+    if not value:
+        raise MultipartParseError(
+            "Content-Type 取值为空",
+            loc,
+            part_index=part_index,
+            code="malformed_header",
+        )
+    segments = value.split(b";")
+    main_type = segments[0]
+    mtype = main_type.split(b"/")
+    if (
+        len(mtype) != 2
+        or not _TOKEN_RE.fullmatch(mtype[0])
+        or not _TOKEN_RE.fullmatch(mtype[1])
+    ):
+        raise MultipartParseError(
+            f"Content-Type {value!r} 不是合法的 type/subtype",
+            loc,
+            part_index=part_index,
+            code="invalid_content_type",
+        )
+    for seg in segments[1:]:
+        param = seg.strip(b" \t")
+        if not param or b"=" not in param:
+            raise MultipartParseError(
+                f"Content-Type 参数 {seg!r} 非法",
+                loc,
+                part_index=part_index,
+                code="invalid_content_type",
+            )
+        name, _, pvalue = param.partition(b"=")
+        name = name.strip(b" \t")
+        pvalue = pvalue.strip(b" \t")
+        if not _TOKEN_RE.fullmatch(name):
+            raise MultipartParseError(
+                f"Content-Type 参数名 {name!r} 非法",
+                loc,
+                part_index=part_index,
+                code="invalid_content_type",
+            )
+        if pvalue.startswith(b'"') and pvalue.endswith(b'"'):
+            if len(pvalue) < 2 or not _QUOTED_VALUE_RE.fullmatch(pvalue[1:-1]):
+                raise MultipartParseError(
+                    "Content-Type 参数 quoted-string 非法",
+                    loc,
+                    part_index=part_index,
+                    code="invalid_content_type",
+                )
+        elif not _TOKEN_RE.fullmatch(pvalue):
+            raise MultipartParseError(
+                f"Content-Type 参数值 {pvalue!r} 非法",
+                loc,
+                part_index=part_index,
+                code="invalid_content_type",
+            )
+    return value.decode("ascii").lower()
+
+
+def _parse_part_headers(
+    header_block: bytes, part_index: int
+) -> tuple[tuple[int, int, int], str]:
+    """按 CRLF 严格解析单个 part 的头部块，返回 (Content-Range, Content-Type)。
+
+    - 每个头部必须是 `name: value`，name 为合法 token；
+    - 仅允许 Content-Type 与 Content-Range，且各自恰好出现一次；
+    - 拒绝折叠（折行）、空名、空值与任何重复/未知头部（头部注入）。
+    """
+    loc = f"parts[{part_index}].headers"
+    if not header_block:
+        raise MultipartParseError(
+            "part 缺少头部块（空行之前没有任何头部）",
+            loc,
+            part_index=part_index,
+            code="missing_headers",
+        )
+    seen: set[str] = set()
+    content_range: tuple[int, int, int] | None = None
+    content_type: str | None = None
+
+    for line_no, line in enumerate(header_block.split(_CRLF)):
+        hloc = f"{loc}[{line_no}]"
+        if not line or line[:1] in (b" ", b"\t"):
+            # 空行在此前已被 split(blank CRLF) 排除；前导空白即折叠/非法行。
+            raise MultipartParseError(
+                "头部出现空行或折叠（obs-fold），拒绝解析",
+                hloc,
+                part_index=part_index,
+                code="header_injection",
+            )
+        if b":" not in line:
+            raise MultipartParseError(
+                f"头部行 {line!r} 缺少 ':'",
+                hloc,
+                part_index=part_index,
+                code="malformed_header",
+            )
+        name, _, value = line.partition(b":")
+        if not _TOKEN_RE.fullmatch(name):
+            raise MultipartParseError(
+                f"头部名 {name!r} 非法",
+                hloc,
+                part_index=part_index,
+                code="malformed_header",
+            )
+        # value 允许 token 前后 OWS，但不允许裸 CR/LF（split 已保证无 CRLF）
+        # 及其他控制字符。
+        stripped = value.strip(b" \t")
+        if any(ch < 0x20 or ch == 0x7F for ch in stripped):
+            raise MultipartParseError(
+                f"头部 {name!r} 的取值包含控制字符",
+                hloc,
+                part_index=part_index,
+                code="header_injection",
+            )
+
+        lname = name.decode("ascii").lower()
+        if lname not in _ALLOWED_PART_HEADERS:
+            raise MultipartParseError(
+                f"part 不允许出现 {name.decode('ascii', 'replace')!r} 头部"
+                "（仅允许 Content-Type 与 Content-Range）",
+                hloc,
+                part_index=part_index,
+                code="unexpected_header",
+            )
+        if lname in seen:
+            raise MultipartParseError(
+                f"part 中 {name.decode('ascii', 'replace')!r} 头部重复出现",
+                hloc,
+                part_index=part_index,
+                code="duplicate_header",
+            )
+        seen.add(lname)
+
+        if lname == "content-type":
+            content_type = _validate_content_type(
+                value, part_index, f"parts[{part_index}].content_type"
+            )
+        else:  # content-range
+            crloc = f"parts[{part_index}].content_range"
+            m = _CONTENT_RANGE_RE.fullmatch(stripped)
+            if m is None:
+                raise MultipartParseError(
+                    f"Content-Range {stripped!r} 不符合 'bytes start-end/total' 格式",
+                    crloc,
+                    part_index=part_index,
+                    code="invalid_content_range",
+                )
+            content_range = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    if "content-range" not in seen:
+        raise MultipartParseError(
+            "part 缺少 Content-Range: bytes start-end/total 头部",
+            f"parts[{part_index}].content_range",
+            part_index=part_index,
+            code="missing_content_range",
+        )
+    if "content-type" not in seen:
+        raise MultipartParseError(
+            "part 缺少 Content-Type 头部",
+            f"parts[{part_index}].content_type",
+            part_index=part_index,
+            code="missing_content_type",
+        )
+    assert content_range is not None and content_type is not None
+    return content_range, content_type
+
+
+def _split_multipart_parts(body: bytes, boundary: str) -> list[tuple[bytes, bytes]]:
+    """按 RFC 2046 风格严格切分 multipart 正文，返回 [(header_block, payload)]。
+
+    严格要求：
+      - 正文必须以 "--" + boundary 开头（拒绝前导 preamble/字节）；
+      - 所有边界行只能以 CRLF 结束（拒绝裸 LF）；
+      - 最后必须以 "--" + boundary + "--" 收尾，其后不得再有任何字节
+        （拒绝 epilogue/拖尾字节）；
+      - 每个 part 必须含 CRLFCRLF 分隔头部与正文，头部块不得为二进制
+        （裸 CR 等非法行由头部解析进一步拒绝）。
+    """
+    delim = b"--" + boundary.encode("ascii")
+    if not body.startswith(delim):
+        raise MultipartParseError(
+            "响应体必须以 '--' + boundary 开头（不允许前导 preamble 或字节）",
+            "body_b64",
+            code="bad_boundary",
+        )
+    pos = len(delim)
+    if body[pos : pos + 2] == _CRLF:
+        closing = False
+        pos += 2
+    elif body[pos : pos + 2] == b"--":
+        # 开边界立即结束：multipart 中没有任何 part。
+        if body[pos + 2 :]:
+            raise MultipartParseError(
+                "结束边界 '--boundary--' 之后存在拖尾字节（不允许 epilogue）",
+                "body_b64",
+                code="trailing_bytes",
+            )
+        raise MultipartParseError(
+            "multipart 响应中没有任何 part",
+            "body_b64",
+            code="empty_multipart",
+        )
+    else:
+        raise MultipartParseError(
+            "boundary 分隔行后必须紧跟 CRLF（不接受裸 LF 或其他字节）",
+            "body_b64",
+            code="bad_boundary_line",
+        )
+
+    parts: list[tuple[bytes, bytes]] = []
+    part_index = 0
+    while True:
+        # 下一处边界：正文以 CRLF "--boundary" 开始，正文内出现的边界
+        # 序列一律视为结构错误（byteranges 正文不应内嵌边界行）。
+        next_at = body.find(_CRLF + delim, pos)
+        if next_at == -1:
+            raise MultipartParseError(
+                "响应体被截断：未找到下一个 boundary 分隔行",
+                "body_b64",
+                part_index=part_index,
+                code="truncated_multipart",
+            )
+        raw_part = body[pos:next_at]
+        sep_at = raw_part.find(_BLANK_CRLF)
+        if sep_at == -1:
+            raise MultipartParseError(
+                "part 缺少头部与正文之间的 CRLFCRLF 分隔",
+                f"parts[{part_index}]",
+                part_index=part_index,
+                code="missing_header_terminator",
+            )
+        parts.append((raw_part[:sep_at], raw_part[sep_at + 4 :]))
+
+        pos = next_at + 2 + len(delim)  # 跳过 CRLF 与 boundary，定位到后续字节
+        tail = body[pos : pos + 2]
+        if tail == b"--":
+            pos += 2
+            if body[pos:]:
+                raise MultipartParseError(
+                    "结束边界 '--boundary--' 之后存在拖尾字节（不允许 epilogue）",
+                    "body_b64",
+                    code="trailing_bytes",
+                )
+            closing = True
+            break
+        if tail != _CRLF:
+            raise MultipartParseError(
+                "boundary 分隔行后必须紧跟 CRLF（不接受裸 LF 或其他字节）",
+                "body_b64",
+                part_index=part_index + 1,
+                code="bad_boundary_line",
+            )
+        pos += 2
+        part_index += 1
+
+    if not closing:  # 理论不可达，防御性检查
+        raise MultipartParseError(
+            "响应体被截断：缺少结束边界 '--boundary--'",
+            "body_b64",
+            code="truncated_multipart",
+        )
+    return parts
+
+
+@app.post("/multipart-parse", response_model=MultipartParseResponse)
+def multipart_parse(req: MultipartParseRequest) -> MultipartParseResponse:
+    """解析并严格校验 multipart/byteranges 响应，按期望 ranges 顺序返回内容。"""
+    expected = _normalize_expected_ranges(req)
+    expected_map = {span: i for i, span in enumerate(expected)}
+
+    body = _decode_b64_multipart(req.body_b64)
+    raw_parts = _split_multipart_parts(body, req.boundary)
+
+    # part 区间 -> (期望范围下标, 数据)；重复区间在解析阶段即拒绝。
+    found: dict[tuple[int, int], tuple[int, bytes]] = {}
+    for part_index, (header_block, payload) in enumerate(raw_parts):
+        (start, end, total), content_type = _parse_part_headers(
+            header_block, part_index
+        )
+
+        if total != req.object_length:
+            raise MultipartParseError(
+                f"Content-Range 声明的对象总长度 {total} 与请求的 "
+                f"{req.object_length} 不一致",
+                f"parts[{part_index}].content_range",
+                part_index=part_index,
+                start=start,
+                end=end,
+                code="object_length_mismatch",
+            )
+        if end < start:
+            raise MultipartParseError(
+                "Content-Range 的闭区间非法：end 不得小于 start",
+                f"parts[{part_index}].content_range",
+                part_index=part_index,
+                start=start,
+                end=end,
+                code="invalid_content_range",
+            )
+        if start < 0 or end >= total:
+            raise MultipartParseError(
+                f"Content-Range [{start},{end}] 越界：对象总长度为 {total}",
+                f"parts[{part_index}].content_range",
+                part_index=part_index,
+                start=start,
+                end=end,
+                code="part_out_of_bounds",
+            )
+        declared_length = end - start + 1
+        if len(payload) != declared_length:
+            raise MultipartParseError(
+                f"part 正文 {len(payload)} 字节，与 Content-Range "
+                f"[{start},{end}] 声明的 {declared_length} 字节不符",
+                f"parts[{part_index}]",
+                part_index=part_index,
+                start=start,
+                end=end,
+                code="part_length_mismatch",
+            )
+        if req.expected_content_type is not None:
+            wanted = req.expected_content_type.strip(" \t").lower()
+            if content_type != wanted:
+                raise MultipartParseError(
+                    f"part Content-Type {content_type!r} 与期望的 "
+                    f"{req.expected_content_type!r} 不一致",
+                    f"parts[{part_index}].content_type",
+                    part_index=part_index,
+                    start=start,
+                    end=end,
+                    code="content_type_mismatch",
+                )
+
+        span = (start, end)
+        if span in found:
+            raise MultipartParseError(
+                f"Content-Range [{start},{end}] 的 part 重复出现",
+                f"parts[{part_index}].content_range",
+                part_index=part_index,
+                range_index=expected_map.get(span),
+                start=start,
+                end=end,
+                code="duplicate_part",
+            )
+        if span not in expected_map:
+            raise MultipartParseError(
+                f"part 区间 [{start},{end}] 不在期望 ranges 中（多余段）",
+                f"parts[{part_index}].content_range",
+                part_index=part_index,
+                start=start,
+                end=end,
+                code="unexpected_part",
+            )
+        found[span] = (expected_map[span], payload)
+
+    missing = [
+        (i, span) for i, span in enumerate(expected) if span not in found
+    ]
+    if missing:
+        first_i, (s, e) = missing[0]
+        raise MultipartParseError(
+            f"缺少 {len(missing)} 个期望范围的 part："
+            + ", ".join(f"[{s2},{e2}]" for _, (s2, e2) in missing),
+            "body_b64",
+            range_index=first_i,
+            start=s,
+            end=e,
+            code="missing_part",
+        )
+
+    results: list[MultipartRange] = []
+    for i, (start, end) in enumerate(expected):
+        _, payload = found[(start, end)]
+        results.append(
+            MultipartRange(
+                index=i,
+                type=req.ranges[i].type,
+                start=start,
+                end=end,
+                length=len(payload),
+                data_b64=base64.b64encode(payload).decode("ascii"),
+            )
+        )
+
+    return MultipartParseResponse(
+        object_length=req.object_length,
+        boundary=req.boundary,
+        parts=len(raw_parts),
+        ranges=results,
+    )
 
 
 # ----------------------------- /secure-request -----------------------------

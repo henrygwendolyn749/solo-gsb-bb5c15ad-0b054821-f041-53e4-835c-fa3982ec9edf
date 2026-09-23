@@ -9,6 +9,12 @@
 - `POST /assemble`：回显 `/plan` 的 `blocks`、`mappings`（以及 `cached_blocks`），
   并分别按块提供 Base64 回源内容与缓存内容；服务严格校验来源 id、边界、缺块
   与重复块后，依据切片映射按原 ranges 顺序重组，返回每段范围的 Base64 内容与长度。
+- `POST /multipart-parse`：解析上游对 Range 请求返回的 `multipart/byteranges`
+  完整响应体（Base64 传入）。服务严格按 CRLF 分隔解析每个 part，校验
+  `Content-Range` 的闭区间、字节长度、对象边界与对象总长度，校验
+  `Content-Type` 合法且各 part 一致，并要求 part 区间唯一且与期望 ranges
+  一一对应；最终**按期望 ranges 顺序**返回各段 Base64 内容。缺段、重复段、
+  错误 boundary、头部注入、非法 Base64、范围不匹配统一返回可定位的 `422`。
 - `POST /secure-request`：上述两个操作的**统一鉴权入口**。请求携带 `operation`
   （`plan` 或 `assemble`）、`payload`（原接口请求体）以及 `key_id` / `timestamp`
   / `nonce` / `signature`；服务按固定 JSON 规范化后用环境配置的 HMAC-SHA256
@@ -242,6 +248,107 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 `cached_blocks` 一起提交给 `/assemble`，即可取回与原请求 ranges 一一对应
 的字节内容。
 
+### `POST /multipart-parse`
+
+解析上游对 `Range: bytes=0-9,240-` 这类请求返回的 `multipart/byteranges`
+响应。请求体包含：
+
+- `object_length`：对象总字节长度；
+- `ranges`：期望范围列表（与 `/plan` 相同的 `interval` / `suffix` 形式），
+  suffix 在对象不足 `last_n` 字节时按 HTTP 语义回落到整个对象；响应必须
+  恰好为每个期望范围提供一个 part，结果**严格按该列表顺序**返回；
+- `boundary`：multipart boundary 的原始值（即上游
+  `Content-Type: multipart/byteranges; boundary=...` 中的 `boundary` 参数，
+  **不含**前导 `--`）；
+- `response_b64`：上游响应体（multipart 报文本身，**不含** HTTP 状态行与
+  外层响应头）的标准 Base64 编码。
+
+```json
+{
+  "object_length": 256,
+  "ranges": [
+    {"type": "interval", "start": 0, "end": 9},
+    {"type": "suffix", "last_n": 16}
+  ],
+  "boundary": "Wk9ByterangesExample7f",
+  "response_b64": "LS1XazlCeXRlcmFuZ2VzRXhhbXBsZTdmDQpDb250ZW50LVJhbmdlOiBieXRlcyAwLTkvMjU2DQpDb250ZW50LVR5cGU6IHRleHQvcGxhaW4NCkVUYWc6ICJyMSINCg0KAAECAwQFBgcICQ0KLS1XazlCeXRlcmFuZ2VzRXhhbXBsZTdmDQpDb250ZW50LVJhbmdlOiBieXRlcyAyNDAtMjU1LzI1Ng0KQ29udGVudC1UeXBlOiB0ZXh0L3BsYWluDQoNCvDx8vP09fb3+Pn6+/z9/v8NCi0tV2s5Qnl0ZXJhbmdlc0V4YW1wbGU3Zi0tDQo="
+}
+```
+
+上面的 Base64 解码后就是严格 CRLF 分隔的 multipart 报文（part 顺序可以与
+期望 ranges 不同，服务按区间匹配）：
+
+```
+--Wk9ByterangesExample7f\r\n
+Content-Range: bytes 0-9/256\r\n
+Content-Type: text/plain\r\n
+ETag: "r1"\r\n
+\r\n
+<0..9 共 10 字节>\r\n
+--Wk9ByterangesExample7f\r\n
+Content-Range: bytes 240-255/256\r\n
+Content-Type: text/plain\r\n
+\r\n
+<240..255 共 16 字节>\r\n
+--Wk9ByterangesExample7f--\r\n
+```
+
+成功响应按 `ranges` 输入顺序返回（suffix 会被规范化为实际闭区间）：
+
+```json
+{
+  "object_length": 256,
+  "content_type": "text/plain",
+  "ranges": [
+    {"index": 0, "type": "interval", "start": 0, "end": 9,
+     "length": 10, "data_b64": "AAECAwQFBgcICQ=="},
+    {"index": 1, "type": "suffix", "start": 240, "end": 255,
+     "length": 16, "data_b64": "8PHy8/T19vf4+fr7/P3+/w=="}
+  ]
+}
+```
+
+解析与校验规则（任一不满足都返回带 `loc` / `part_index` / `range_index`
+定位信息的 `422`）：
+
+1. **严格 CRLF 结构**：所有头部行、空行、边界分隔行都必须以 CRLF 结束，
+   裸 LF/裸 CR 一律拒绝；boundary 分隔行必须精确匹配（`--boundary` 或
+   关闭符 `--boundary--`，普通分隔行后只允许 SP/HTAB 传输填充）；
+   关闭分隔符必须是报文最后内容，不接受 preamble/epilogue 垃圾字节；
+2. **Base64**：`response_b64` 必须是带正确 `=` 填充的标准 Base64
+   （`validate` 模式解码，拒绝 URL-safe 变体与嵌入空白）；
+3. **头部注入防护**：头部字段名必须是合法 token 且含冒号；拒绝以空白开头
+   的折叠/延续行（`obs-fold`）、非 ASCII / NUL / 其他控制字符；
+4. **Content-Range**：每个 part 必须且只能携带一个
+   `Content-Range: bytes <start>-<end>/<total>`；范围单位必须是 `bytes`
+   （大小写不敏感）、闭区间合法（`end >= start`）、`<total>` 等于
+   `object_length`、`end < total`，且 part 正文字节数必须等于
+   `end - start + 1`；
+5. **Content-Type**：每个 part 必须且只能携带一个语法合法的
+   `Content-Type`（`type/subtype` 加可选 `;key=value` 参数），各 part 的
+   媒体类型必须一致；成功响应的 `content_type` 返回统一的 `type/subtype`；
+6. **part 唯一性与匹配**：不同 part 的 `Content-Range` 区间不得重复；
+   解析出的区间集合必须与期望 ranges 规范化后的闭区间集合**完全相等**——
+   缺段、多余段、区间偏移不一致都会被拒绝；
+7. **期望 ranges**：interval 不得颠倒或越界，空对象不接受 suffix，
+   规范化后相互重复的期望范围（含 interval 与 suffix 重合）也会被拒绝，
+   因为无法区分同区间的两段响应。
+
+`loc` 形如 `response_b64.parts[1].headers.Content-Range`，
+`part_index` 是 part 在报文中的出现序号（从 0 开始），`range_index` 是
+期望 ranges 的下标。典型错误示例（part 缺段）：
+
+```json
+{
+  "error": "missing_part",
+  "detail": [{
+    "message": "缺少期望 ranges[1]（[240,255]）对应的 part",
+    "loc": "response_b64.parts",
+    "range_index": 1
+  }]
+}
+```
+
 ### `POST /secure-request`
 
 `/plan` 与 `/assemble` 的统一鉴权入口。`payload` 字段就是对应操作的原始
@@ -367,6 +474,40 @@ envelope["signature"] = hmac.new(
   | `block_out_of_bounds`       | 回源块超出对象长度                 |
   | `duplicate_mapping_index`   | mappings 中下标重复                |
   | `invalid_mapping_index`     | mappings 下标未覆盖 0..N-1         |
+
+- `/multipart-parse` 解析错误：`{"error": "<code>", "detail": [{"message": ..., "loc": ..., "part_index": ..., "range_index": ...}]}`，
+  其中 `loc` 指向请求字段路径（如 `boundary`、`response_b64`、
+  `response_b64.parts[2].headers.Content-Range`），并按需附带
+  `part_index` / `range_index`。主要错误码：
+
+  | error                            | 含义                                         |
+  | -------------------------------- | -------------------------------------------- |
+  | `invalid_boundary`               | boundary 含非法字符或长度不合规              |
+  | `invalid_base64`                 | response_b64 非法或填充错误                  |
+  | `bad_boundary`                   | 边界分隔行不匹配、含非法字符或存在 epilogue  |
+  | `malformed_multipart`            | multipart 结构残缺（缺 CRLF、被截断等）      |
+  | `empty_multipart`                | multipart 体不包含任何 part                  |
+  | `too_many_parts`                 | part 数量超过 1000 上限                      |
+  | `header_injection`               | 折叠头、非 ASCII/控制字符等头部注入迹象      |
+  | `invalid_part_header`            | 头部字段名非法或缺冒号                       |
+  | `duplicate_header`               | Content-Range / Content-Type 重复出现        |
+  | `missing_content_range`          | part 缺少 Content-Range 头部                 |
+  | `invalid_content_range`          | Content-Range 不符合 bytes start-end/total   |
+  | `invalid_content_range_unit`     | Content-Range 范围单位不是 bytes             |
+  | `content_range_inverted`         | Content-Range 闭区间 end 小于 start          |
+  | `content_range_out_of_bounds`    | Content-Range 区间超出对象边界               |
+  | `content_range_total_mismatch`   | Content-Range 上报的对象总长度与请求不一致   |
+  | `part_length_mismatch`           | part 正文字节数与 Content-Range 声明不符     |
+  | `missing_content_type`           | part 缺少 Content-Type 头部                  |
+  | `invalid_content_type`           | Content-Type 不是合法媒体类型                |
+  | `content_type_mismatch`          | 各 part 的媒体类型不一致                     |
+  | `duplicate_part`                 | 多个 part 的 Content-Range 区间重复          |
+  | `missing_part`                   | 响应缺少期望 range 对应的 part               |
+  | `unexpected_part`                | 响应包含不属于期望 ranges 的多余 part        |
+  | `duplicate_expected_range`       | 期望 ranges 规范化后相互重复                 |
+  | `range_out_of_bounds`            | 期望 interval 超出对象边界                   |
+  | `invalid_range`                  | 期望 interval 的 end 小于 start              |
+  | `unsatisfiable_suffix`           | 空对象上请求 suffix                          |
 
 `/secure-request` 的鉴权类错误（均为 `{"error": ..., "message": ...}`）：
 

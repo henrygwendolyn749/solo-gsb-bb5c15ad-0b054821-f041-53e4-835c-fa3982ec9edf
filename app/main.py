@@ -18,6 +18,14 @@ operation（plan 或 assemble）、payload（即原接口请求体）、key_id�
 timestamp、nonce、signature；服务按固定 JSON 规范化后用环境配置的
 HMAC-SHA256 密钥验签，限制时间偏差，并对 key_id+nonce 做窗口内防重放。
 验签通过后执行对应操作并原样返回其响应；/plan 与 /assemble 本身不受影响。
+
+POST /multipart-parse 解析上游返回的 multipart/byteranges 响应：请求提供
+对象总长度、期望的 interval/suffix ranges、boundary 以及 Base64 编码的
+完整响应体。服务严格按 CRLF 分隔解析每个 part，逐段校验 Content-Range 的
+闭区间、字节长度、对象边界与 Content-Range 上报的对象总长度，并校验
+Content-Type 合法且各 part 一致、part 区间唯一且与期望 ranges 一一对应，
+最后按期望 ranges 的顺序返回每段内容的标准 Base64。缺段、重复段、错误
+boundary、头部注入、非法 Base64 或范围不匹配都返回带定位信息的 422。
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import threading
 import time
 from typing import Annotated, Any, Literal, Union
@@ -1082,6 +1091,535 @@ def assemble(req: AssembleRequest) -> AssembleResponse:
         )
 
     return AssembleResponse(object_length=req.object_length, ranges=results)
+
+
+# ----------------------------- /multipart-parse -----------------------------
+
+
+class MultipartParseError(Exception):
+    """multipart/byteranges 解析/语义校验失败，统一对应 HTTP 422。
+
+    loc 为可定位的请求字段路径（如 ``parts[2].headers.Content-Range``），
+    part_index / range_index 在适用时给出；code 为稳定的机器可读错误码。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        code: str = "multipart_error",
+        *,
+        loc: str | None = None,
+        part_index: int | None = None,
+        range_index: int | None = None,
+    ):
+        self.message = message
+        self.code = code
+        self.loc = loc
+        self.part_index = part_index
+        self.range_index = range_index
+        super().__init__(message)
+
+
+@app.exception_handler(MultipartParseError)
+async def multipart_parse_error_handler(
+    request: Request, exc: MultipartParseError
+) -> JSONResponse:
+    detail: dict[str, object] = {"message": exc.message}
+    if exc.loc is not None:
+        detail["loc"] = exc.loc
+    if exc.part_index is not None:
+        detail["part_index"] = exc.part_index
+    if exc.range_index is not None:
+        detail["range_index"] = exc.range_index
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "detail": [detail]},
+    )
+
+
+# RFC 2046 bcharsnospace：boundary 中允许的字符（不含空格）。
+_BOUNDARY_CHARS = re.compile(
+    rb"^[A-Za-z0-9'()+_,\-./:=?]{1,69}(?:[ \t][A-Za-z0-9'()+_,\-./:=?]{1,69})*$"
+)
+# RFC 7230 token：头部字段名允许的字符（不含冒号与空格）。
+_HEADER_TOKEN = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
+# 头部字段值允许的可观测字节：可见 ASCII、SP、HTAB（拒绝 NUL/其他控制字符/非 ASCII）。
+_HEADER_VALUE_CHARS = re.compile(rb"^[\t\x20-\x7e]*\Z")
+# RFC 7233 Content-Range: bytes <start>-<end>/<total>
+_CONTENT_RANGE_RE = re.compile(
+    r"^([A-Za-z0-9!#$%&'*+\-.^_`|~]+)\s+(\d+)-(\d+)/(\d+)$"
+)
+# RFC 7231 Content-Type：type/subtype + 可选 ;key=token|"quoted" 参数。
+_TCHAR = r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+"
+# quoted-string 内允许的文本（排除引号与反斜杠；obs-text 非 ASCII 不接受）。
+_QDTEXT = r"[\t \x21\x23-\x5b\x5d-\x7e]"
+_QUOTED_PAIR = r"\\[\t \x21-\x7e]"
+_MEDIA_TYPE_RE = re.compile(
+    r"^" + _TCHAR + r"/" + _TCHAR
+    + r"(?:[ \t]*;[ \t]*" + _TCHAR + r"=(?:" + _TCHAR
+    + r'|"(?:' + _QDTEXT + r"|" + _QUOTED_PAIR + r')*"))*$'
+)
+
+_MAX_PARTS = 1000
+_MAX_HEADER_BLOCK = 64 * 1024
+
+
+class MultipartParseRequest(BaseModel):
+    """POST /multipart-parse 请求体。"""
+
+    object_length: Annotated[int, StrictInt] = Field(
+        ..., ge=0, description="对象总字节长度"
+    )
+    ranges: list[RangeSpec] = Field(
+        ...,
+        min_length=1,
+        description="期望的范围列表（闭区间或 suffix），决定返回顺序",
+    )
+    boundary: str = Field(
+        ...,
+        min_length=1,
+        max_length=69,
+        description=(
+            "multipart boundary（不含前导 --，即 Content-Type 的 "
+            "boundary 参数原始值）"
+        ),
+    )
+    response_b64: str = Field(
+        ...,
+        min_length=1,
+        description="上游 multipart/byteranges 完整响应体（标准 Base64）",
+    )
+
+
+class ParsedRange(BaseModel):
+    index: int = Field(..., description="该范围在请求 ranges 中的下标")
+    type: Literal["interval", "suffix"]
+    start: int = Field(..., description="规范化后的起始字节偏移（含）")
+    end: int = Field(..., description="规范化后的结束字节偏移（含）")
+    length: int = Field(..., ge=1, description="字节数")
+    data_b64: str = Field(..., description="对应 part 的内容（标准 Base64）")
+
+
+class MultipartParseResponse(BaseModel):
+    object_length: int
+    content_type: str = Field(
+        ..., description="各 part 统一携带的媒体类型（type/subtype，不含参数）"
+    )
+    ranges: list[ParsedRange] = Field(
+        ..., description="严格按请求 ranges 顺序排列的各段内容"
+    )
+
+
+def _multipart_error(
+    message: str,
+    code: str = "malformed_multipart",
+    *,
+    part_index: int | None = None,
+    range_index: int | None = None,
+    suffix: str = "",
+) -> MultipartParseError:
+    """以 response_b64 解码体为定位构造 multipart 解析错误。"""
+    loc = "response_b64"
+    if part_index is not None:
+        loc += f".parts[{part_index}]"
+    loc += suffix
+    return MultipartParseError(
+        message, code, loc=loc, part_index=part_index, range_index=range_index
+    )
+
+
+def _consume_boundary_line(
+    body: bytes,
+    pos: int,
+    delimiter: bytes,
+    *,
+    part_index: int | None = None,
+) -> tuple[bool, int]:
+    """在 pos 处消费一条 boundary 分隔行。
+
+    严格按 RFC 2046 的分隔行语法：``--boundary`` 后只允许传输填充
+    （SP/HTAB）与 CRLF；``--boundary--`` 为关闭分隔符，其后不得有任何
+    填充。返回 (是否关闭分隔符, 行尾后的偏移)。
+    """
+    if not body.startswith(delimiter, pos):
+        raise _multipart_error(
+            "期望边界分隔行 '--{b}...'，实际字节不匹配".format(
+                b=delimiter[2:].decode("ascii", "replace")
+            ),
+            "bad_boundary",
+            part_index=part_index,
+        )
+    end = body.find(b"\r\n", pos + len(delimiter))
+    if end == -1:
+        raise _multipart_error(
+            "边界分隔行后缺少 CRLF（响应体可能被截断）",
+            "malformed_multipart",
+            part_index=part_index,
+        )
+    tail = body[pos + len(delimiter) : end]
+    if tail == b"--":
+        return True, end + 2
+    if not re.fullmatch(rb"[ \t]*", tail):
+        raise _multipart_error(
+            "边界分隔行含有非法字符（只允许 -- 或 SP/HTAB 传输填充）",
+            "bad_boundary",
+            part_index=part_index,
+        )
+    return False, end + 2
+
+
+def _parse_part_headers(
+    body: bytes, pos: int, part_index: int
+) -> tuple[list[tuple[str, str]], int]:
+    """读取并解析一个 part 的头部块，返回 [(小写名, 原值)] 与正文起始偏移。
+
+    所有头部行必须以 CRLF 结束；空行（CRLF）结束头部块。拒绝裸 LF/裸
+    CR、折叠行（头部注入）、非 ASCII/控制字符以及缺冒号的伪头部。
+    """
+    headers: list[tuple[str, str]] = []
+    header_bytes_total = 0
+    while True:
+        line_end = body.find(b"\r\n", pos)
+        if line_end == -1:
+            raise _multipart_error(
+                f"part {part_index} 的头部缺少 CRLF 结束（响应体被截断）",
+                part_index=part_index,
+            )
+        line = body[pos:line_end]
+        if not line:  # 空行：头部结束，正文从 CRLF 之后开始
+            return headers, line_end + 2
+        if header_bytes_total + len(line) > _MAX_HEADER_BLOCK:
+            raise _multipart_error(
+                f"part {part_index} 的头部块超过 {_MAX_HEADER_BLOCK} 字节上限",
+                "header_injection",
+                part_index=part_index,
+                suffix=".headers",
+            )
+        header_bytes_total += len(line)
+        if line[:1] in (b" ", b"\t"):
+            raise _multipart_error(
+                f"part {part_index} 出现以空白开头的折叠/延续头部行，"
+                "拒绝可能的头部注入",
+                "header_injection",
+                part_index=part_index,
+                suffix=".headers",
+            )
+        if not _HEADER_VALUE_CHARS.fullmatch(line):
+            raise _multipart_error(
+                f"part {part_index} 的头部行含非 ASCII 或控制字符（含裸 CR/LF），"
+                "拒绝可能的头部注入",
+                "header_injection",
+                part_index=part_index,
+                suffix=".headers",
+            )
+        colon = line.find(b":")
+        if colon <= 0:
+            raise _multipart_error(
+                f"part {part_index} 的头部行 {line!r} 缺少字段名或冒号",
+                "invalid_part_header",
+                part_index=part_index,
+                suffix=".headers",
+            )
+        name, value = line[:colon], line[colon + 1 :]
+        if not _HEADER_TOKEN.fullmatch(name):
+            raise _multipart_error(
+                f"part {part_index} 的头部字段名 {name!r} 不是合法 token",
+                "invalid_part_header",
+                part_index=part_index,
+            )
+        if value[:1] in (b" ", b"\t"):
+            value = value[1:]
+        if value[-1:] in (b" ", b"\t"):
+            value = value.rstrip(b" \t")
+        headers.append((name.decode("ascii").lower(), value.decode("ascii")))
+        pos = line_end + 2
+
+
+def parse_multipart_body(
+    raw: bytes, boundary: str
+) -> list[tuple[list[tuple[str, str]], bytes]]:
+    """严格按 CRLF 边界解析完整 multipart 体，返回 (头部, 正文) 列表。
+
+    不接受任何 preamble/epilogue（关闭分隔符前只允许 RFC 规定的单个
+    CRLF 前导，关闭分隔符必须是响应体最后一个字节）。
+    """
+    delimiter = b"--" + boundary.encode("ascii")
+    pos = 0
+    # RFC 2046 允许前导 CRLF（上一个分隔行的换行）；其余前导字节一律拒绝。
+    if raw.startswith(b"\r\n"):
+        pos = 2
+    closed, pos = _consume_boundary_line(raw, pos, delimiter)
+    if closed:
+        raise _multipart_error("multipart 体不包含任何 part", "empty_multipart")
+
+    parts: list[tuple[list[tuple[str, str]], bytes]] = []
+    while True:
+        if len(parts) >= _MAX_PARTS:
+            raise _multipart_error(
+                f"part 数量超过 {_MAX_PARTS} 的上限", "too_many_parts",
+                part_index=len(parts),
+            )
+        headers, header_end = _parse_part_headers(raw, pos, len(parts))
+
+        # 正文一直延伸到下一个 CRLF + 分隔符（分隔符前的 CRLF 不属于正文）。
+        marker = b"\r\n" + delimiter
+        next_pos = raw.find(marker, header_end)
+        if next_pos == -1:
+            raise _multipart_error(
+                f"part {len(parts)} 的正文后未找到边界分隔符"
+                "（boundary 错误或响应体被截断）",
+                "bad_boundary",
+                part_index=len(parts),
+            )
+        part_body = raw[header_end:next_pos]
+        parts.append((headers, part_body))
+        pos = next_pos + 2  # 跳过正文后的 CRLF，从 "--boundary" 开始
+
+        closed, pos = _consume_boundary_line(
+            raw, pos, delimiter, part_index=len(parts) - 1
+        )
+        if closed:
+            if pos != len(raw):
+                raise _multipart_error(
+                    "关闭分隔符 '--boundary--' 后不允许 epilogue 内容",
+                    "bad_boundary",
+                    part_index=len(parts) - 1,
+                )
+            return parts
+
+
+def _header_values(
+    headers: list[tuple[str, str]], name: str
+) -> list[str]:
+    return [v for k, v in headers if k == name]
+
+
+@app.post("/multipart-parse", response_model=MultipartParseResponse)
+def multipart_parse(req: MultipartParseRequest) -> MultipartParseResponse:
+    # 1. boundary 字符集校验（空格不得位于首尾）。
+    try:
+        boundary_bytes = req.boundary.encode("ascii")
+    except UnicodeEncodeError:
+        boundary_bytes = b""
+    if not _BOUNDARY_CHARS.fullmatch(boundary_bytes):
+        raise MultipartParseError(
+            "boundary 只能包含 ASCII 可见字符（RFC 2046 bchars，"
+            "首尾不得为空格），长度不超过 69",
+            "invalid_boundary",
+            loc="boundary",
+        )
+
+    # 2. 规范化期望 ranges（suffix 在短对象时按 HTTP 语义回落到整个对象），
+    #    并拒绝规范化后重复的范围——响应中无法区分同区间的两段。
+    expected: list[tuple[int, int, str]] = []
+    seen_intervals: dict[tuple[int, int], int] = {}
+    for i, spec in enumerate(req.ranges):
+        if spec.type == "interval":
+            start, end = spec.start, spec.end
+            if end < start:
+                raise MultipartParseError(
+                    "end 不得小于 start",
+                    "invalid_range",
+                    loc=f"ranges[{i}].end",
+                    range_index=i,
+                )
+            if end >= req.object_length:
+                raise MultipartParseError(
+                    f"区间 [{start},{end}] 越界：对象长度为 {req.object_length}",
+                    "range_out_of_bounds",
+                    loc=f"ranges[{i}].end",
+                    range_index=i,
+                )
+        else:
+            if req.object_length == 0:
+                raise MultipartParseError(
+                    "空对象无法满足 suffix 范围请求",
+                    "unsatisfiable_suffix",
+                    loc=f"ranges[{i}].last_n",
+                    range_index=i,
+                )
+            start = max(0, req.object_length - spec.last_n)
+            end = req.object_length - 1
+        prev = seen_intervals.get((start, end))
+        if prev is not None:
+            raise MultipartParseError(
+                f"ranges[{i}] 与 ranges[{prev}] 规范化后同为 [{start},{end}]，"
+                "期望范围不得重复",
+                "duplicate_expected_range",
+                loc=f"ranges[{i}]",
+                range_index=i,
+            )
+        seen_intervals[(start, end)] = i
+        expected.append((start, end, spec.type))
+
+    # 3. 严格解码完整响应体（标准 Base64，含正确的 = 填充）。
+    if len(req.response_b64) % 4 != 0:
+        raise MultipartParseError(
+            "Base64 长度不是 4 的倍数，缺少填充或包含非法字符",
+            "invalid_base64",
+            loc="response_b64",
+        )
+    try:
+        raw = base64.b64decode(req.response_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise MultipartParseError(
+            f"Base64 解码失败：{exc}",
+            "invalid_base64",
+            loc="response_b64",
+        )
+
+    # 4. 严格按 CRLF 边界解析 multipart 结构。
+    parts = parse_multipart_body(raw, req.boundary)
+
+    # 5. 逐 part 校验头部：Content-Range 必填唯一、闭区间/长度/边界/对象
+    #    总长度一致；Content-Type 必填、语法合法；区间在 part 间唯一。
+    parsed: dict[tuple[int, int], bytes] = {}
+    part_positions: dict[tuple[int, int], int] = {}
+    content_type_seen: str | None = None
+    for pidx, (headers, payload) in enumerate(parts):
+        def perr(
+            msg: str,
+            code: str,
+            *,
+            header: str | None = None,
+            range_index: int | None = None,
+        ) -> MultipartParseError:
+            loc = f"response_b64.parts[{pidx}]"
+            if header is not None:
+                loc += f".headers.{header}"
+            return MultipartParseError(
+                msg, code, loc=loc, part_index=pidx, range_index=range_index
+            )
+
+        cr_headers = _header_values(headers, "content-range")
+        if not cr_headers:
+            raise perr("缺少 Content-Range 头部", "missing_content_range",
+                       header="Content-Range")
+        if len(cr_headers) > 1:
+            raise perr("Content-Range 头部出现多次", "duplicate_header",
+                       header="Content-Range")
+        m = _CONTENT_RANGE_RE.match(cr_headers[0].strip())
+        if m is None:
+            raise perr(
+                f"Content-Range {cr_headers[0]!r} 不是合法的 "
+                "'bytes <start>-<end>/<total>' 形式",
+                "invalid_content_range",
+                header="Content-Range",
+            )
+        unit, start_s, end_s, total_s = m.groups()
+        if unit.lower() != "bytes":
+            raise perr(
+                f"Content-Range 的范围单位必须是 bytes，实际为 {unit!r}",
+                "invalid_content_range_unit",
+                header="Content-Range",
+            )
+        start, end, total = int(start_s), int(end_s), int(total_s)
+        if end < start:
+            raise perr(
+                f"Content-Range 报告的区间 [{start},{end}] 非法：end 不得小于 start",
+                "content_range_inverted",
+                header="Content-Range",
+            )
+        if total != req.object_length:
+            raise perr(
+                f"Content-Range 报告的对象总长度 {total} 与请求的 "
+                f"{req.object_length} 不一致",
+                "content_range_total_mismatch",
+                header="Content-Range",
+            )
+        if end >= total:
+            raise perr(
+                f"Content-Range 区间 [{start},{end}] 超出对象边界（总长度 {total}）",
+                "content_range_out_of_bounds",
+                header="Content-Range",
+            )
+        declared_len = end - start + 1
+        if len(payload) != declared_len:
+            raise perr(
+                f"part 正文 {len(payload)} 字节，与 Content-Range 声明的 "
+                f"[{start},{end}]（{declared_len} 字节）长度不符",
+                "part_length_mismatch",
+            )
+        if (start, end) in parsed:
+            raise perr(
+                f"Content-Range 区间 [{start},{end}] 在多个 part 中重复出现",
+                "duplicate_part",
+                header="Content-Range",
+            )
+
+        ct_headers = _header_values(headers, "content-type")
+        if not ct_headers:
+            raise perr("缺少 Content-Type 头部", "missing_content_type",
+                       header="Content-Type")
+        if len(ct_headers) > 1:
+            raise perr("Content-Type 头部出现多次", "duplicate_header",
+                       header="Content-Type")
+        ct_raw = ct_headers[0].strip()
+        if not _MEDIA_TYPE_RE.match(ct_raw):
+            raise perr(
+                f"Content-Type {ct_raw!r} 不是合法的媒体类型",
+                "invalid_content_type",
+                header="Content-Type",
+            )
+        media_type = ct_raw.split(";", 1)[0].strip().lower()
+        if content_type_seen is None:
+            content_type_seen = media_type
+        elif media_type != content_type_seen:
+            raise perr(
+                f"part 的 Content-Type {media_type!r} 与前一个 part 的 "
+                f"{content_type_seen!r} 不一致，multipart/byteranges 各段"
+                "必须为同一媒体类型",
+                "content_type_mismatch",
+                header="Content-Type",
+            )
+
+        parsed[(start, end)] = payload
+        part_positions[(start, end)] = pidx
+
+    # 6. part 集合必须与期望 ranges 一一对应：缺段、多段、范围不匹配都拒绝。
+    got = set(parsed)
+    wanted = {(s, e) for s, e, _ in expected}
+    if got != wanted:
+        unexpected = sorted(got - wanted)
+        missing = sorted(wanted - got)
+        if unexpected:
+            s, e = unexpected[0]
+            raise _multipart_error(
+                f"响应包含不属于期望 ranges 的多余 part：[{s},{e}]",
+                "unexpected_part",
+                part_index=part_positions[(s, e)],
+            )
+        s, e = missing[0]
+        ridx = next(
+            i for i, (ws, we, _) in enumerate(expected) if (ws, we) == (s, e)
+        )
+        raise MultipartParseError(
+            f"缺少期望 ranges[{ridx}]（[{s},{e}]）对应的 part",
+            "missing_part",
+            loc="response_b64.parts",
+            range_index=ridx,
+        )
+
+    # 7. 全部通过：按期望 ranges 顺序取材并重新做标准 Base64。
+    results: list[ParsedRange] = []
+    for i, (start, end, rtype) in enumerate(expected):
+        payload = parsed[(start, end)]
+        results.append(
+            ParsedRange(
+                index=i,
+                type=rtype,  # type: ignore[arg-type]
+                start=start,
+                end=end,
+                length=len(payload),
+                data_b64=base64.b64encode(payload).decode("ascii"),
+            )
+        )
+
+    return MultipartParseResponse(
+        object_length=req.object_length,
+        content_type=content_type_seen or "application/octet-stream",
+        ranges=results,
+    )
 
 
 # ----------------------------- /secure-request -----------------------------
